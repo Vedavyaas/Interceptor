@@ -116,7 +116,7 @@ kafka-console-consumer.sh \
   "company":     { "companyName": "Your Company Name" },
   "agent":       { "agentId": "agent-01", "hostname": "prod-server-01", "ipAddress": "10.0.1.25" },
   "resource":    { "resourceType": "POSTGRESQL", "resourceId": "db-prod-01", "environment": "PRODUCTION", "region": "ap-south-1", "availabilityZone": "ap-south-1a" },
-  "compute":     { "cpuUsagePercent": 42.7, "cpuCores": 8, "loadAverage1m": 1.8, "loadAverage5m": 1.4, "loadAverage15m": 1.2 },
+  "compute":     { "cpuUsagePercent": 3.42, "cpuCores": 8, "loadAverage1m": 1.8, "loadAverage5m": 1.4, "loadAverage15m": 1.2 },
   "memory":      { "totalMB": 16384, "usedMB": 9216, "freeMB": 7168, "usagePercent": 56.2 },
   "network":     { "networkInMB": 245.76, "networkOutMB": 512.0, "activeConnections": 67 },
   "disk":        { "diskReadMB": 128.4, "diskWriteMB": 84.2, "diskUsagePercent": 48.3, "storageUsedGB": 380.5 },
@@ -125,6 +125,50 @@ kafka-console-consumer.sh \
 }
 ```
 
+> **`compute.cpuUsagePercent`** — On Linux this is the CPU percentage consumed by the **exact OS thread** that handled the request (sourced from `/proc/<pid>/task/<tid>/stat`), not a host-wide average. On non-Linux hosts it falls back to the JVM MXBean host-level value.
+
+---
+
+## How It Works
+
+Each intercepted request goes through a two-phase measurement pipeline:
+
+```
+REQUEST THREAD                        BACKGROUND EXECUTOR THREAD
+────────────────────────────────      ─────────────────────────────────────────
+1. Resolve OS thread ID (TID)
+   from /proc/self/task/          ──┐
+                                    │
+2. Read /proc/<pid>/task/<tid>/stat │  (before-snapshot: utime, stime jiffies)
+                                    │
+3. pjp.proceed()  ← actual request  │
+                                    │
+4. Capture elapsedMs, authHeader ───┘──► publishEvent(elapsedMs, tid, statBefore)
+                                              │
+                                              ├─ Read /proc/<pid>/task/<tid>/stat
+                                              │  (after-snapshot on executor thread)
+                                              │
+                                              ├─ delta jiffies ÷ wall-clock → CPU %
+                                              │
+                                              ├─ systemMetrics.getLatest()
+                                              │  (memory, disk, network from cache)
+                                              │
+                                              └─ kafkaController.sendMessage(payload)
+```
+
+### CPU metric sourcing
+
+| Host OS | `cpuUsagePercent` source | Precision |
+|---|---|---|
+| **Linux** | `/proc/<pid>/task/<tid>/stat` delta (utime + stime jiffies) | Per-thread, per-request |
+| **macOS / Windows** | JVM `OperatingSystemMXBean.getCpuLoad()` | Host-wide, ~5 s cached |
+
+All other metrics (memory, disk, network, load averages) always come from the background scheduler cache regardless of OS.
+
+### Background host metrics scheduler
+
+A single daemon thread refreshes host-level metrics every **5 seconds** into an `AtomicReference`. The AOP layer reads this cache lock-free — zero filesystem or MXBean access on the hot request path (except for the fast `/proc/self/task` TID resolution on Linux).
+
 ---
 
 ## What the Library Does Automatically
@@ -132,13 +176,16 @@ kafka-console-consumer.sh \
 | Feature | Details |
 |---|---|
 | **Zero-code activation** | Spring Boot auto-configuration picks it up from the classpath |
-| **AOP interception** | Wraps every `@RestController` method transparently |
+| **AOP interception** | Wraps every `@RestController`, `@Service`, `@Repository`, `@Component` method transparently |
+| **Inner-call guard** | Only the outermost intercepted call per request fires an event (no duplicate events from Controller → Service → Repository chains) |
+| **Per-thread CPU** | On Linux, resolves the OS TID and reads `/proc/<pid>/task/<tid>/stat` to report CPU consumed by that exact thread during the request |
 | **JWT parsing** | Extracts `agent-id` from the `Authorization` header |
-| **System metrics** | Live CPU, memory, network I/O, disk I/O via JVM MXBeans |
-| **Application metrics** | Rolling requests/min, error rate %, response time per request |
+| **Host metrics** | Background-scheduled collection of memory, disk I/O, network I/O, and load averages via `/proc` and JVM MXBeans |
+| **Application metrics** | Rolling requests/min, error rate %, response time per request (1-minute window) |
 | **Kafka delivery** | Internal isolated producer — `acks=all`, idempotent, snappy compression |
 | **Kafka topic** | Fixed: `cloud_metrics` |
 | **Non-interference** | Library's `KafkaTemplate` is qualified — will never conflict with your app's own Kafka beans |
+| **Graceful shutdown** | Executor flushes queued events before JVM exit |
 
 ---
 
@@ -161,5 +208,6 @@ kafka-console-consumer.sh \
 |---|---|---|
 | No events in Kafka | AOP not activated | Ensure `spring-boot-starter-aop` is not excluded in your app |
 | `agent-id` = `"unknown"` | JWT missing claim | Add `agent-id` to your JWT payload |
+| `cpuUsagePercent` looks host-wide | Not running on Linux | Per-thread CPU requires `/proc` — macOS/Windows automatically fall back to the MXBean value |
 | Bean conflict on `KafkaTemplate` | Name collision | Library uses `@Qualifier("interceptorKafkaTemplate")` — rename any bean with that exact name in your app |
 | `app.prop.*` not binding | Wrong JAR variant | Confirm the plain JAR (not `-exec.jar`) is on the classpath |
